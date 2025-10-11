@@ -1,0 +1,12 @@
+# Core dependencies for FlyFlirt
+PyQt6>=6.5
+opencv-python>=4.8
+numpy>=1.25
+pandas>=2.0
+scipy>=1.11
+
+# Optional: testing and development tools
+pytest>=8.0
+black>=24.0
+ruff>=0.6
+isort>=5.12

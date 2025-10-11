@@ -1,0 +1,69 @@
+# Python build and cache files
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.pdb
+*.egg-info/
+*.egg
+build/
+dist/
+.eggs/
+
+# Virtual environments
+.venv/
+venv/
+ENV/
+env/
+env.bak/
+pip-wheel-metadata/
+
+# IDE and editor files
+.idea/
+.vscode/
+*.sublime-project
+*.sublime-workspace
+
+# OS-specific files
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Test and coverage
+.coverage
+coverage.xml
+.pytest_cache/
+.tox/
+.nox/
+htmlcov/
+
+# Logs and temporary files
+*.log
+*.tmp
+*.bak
+*.swp
+
+# Environments and secrets
+.env
+.env.local
+.env.test
+.env.production
+*.key
+*.pem
+
+# Jupyter and notebooks
+.ipynb_checkpoints/
+*.ipynb
+
+# Dataset or video files (large binary data)
+*.mp4
+*.avi
+*.mov
+*.mkv
+*.csv
+*.json
+*.zip
+
+# Docs and build artifacts
+docs/_build/
+site/

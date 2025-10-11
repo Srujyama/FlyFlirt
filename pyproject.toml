@@ -1,0 +1,52 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "flyflirt"
+version = "0.1.0"
+description = "FlyFlirt: Drosophila Behavior Analysis Toolkit (PyQt6-based GUI for ROI tracking and mating-event detection)"
+readme = "README.md"
+authors = [
+  { name = "Srujan Yamali" }
+]
+license = { text = "MIT" }
+requires-python = ">=3.9"
+dependencies = [
+  "PyQt6>=6.5",
+  "opencv-python>=4.8",
+  "numpy>=1.25",
+  "pandas>=2.0",
+  "scipy>=1.11"
+]
+
+[project.urls]
+Homepage = "https://srujanyamali.tech/FlyFlirt"
+Repository = "https://github.com/Srujyama/Drosophila-Desire-Detector"
+
+[project.scripts]
+flyflirt = "flyflirt.cli:main"
+
+[tool.setuptools]
+package-dir = {"" = "."}
+
+[tool.setuptools.packages.find]
+where = ["flyflirt"]
+
+[tool.pytest.ini_options]
+minversion = "8.0"
+addopts = "-ra -q"
+testpaths = ["tests"]
+
+[tool.black]
+line-length = 100
+target-version = ["py39"]
+
+[tool.isort]
+profile = "black"
+line_length = 100
+
+[tool.ruff]
+line-length = 100
+select = ["E", "F", "W", "C90"]
+ignore = ["E203", "E266", "E501"]

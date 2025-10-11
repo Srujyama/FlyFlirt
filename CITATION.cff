@@ -1,0 +1,32 @@
+cff-version: 1.2.0
+message: "If you use this software, please cite it as shown below."
+title: "FlyFlirt: Drosophila Behavior Analysis Toolkit"
+authors:
+  - family-names: "Yamali"
+    given-names: "Srujan"
+    orcid: "https://orcid.org/0000-0000-0000-0000"
+abstract: >
+  FlyFlirt is a PyQt6-based graphical interface and analysis pipeline for Drosophila
+  courtship and mating behavior. It automates ROI detection, mating event tracking,
+  and behavioral quantification from high-resolution videos, exporting data in structured
+  CSV and JSON formats for reproducible research.
+keywords:
+  - Drosophila
+  - behavioral analysis
+  - PyQt6
+  - OpenCV
+  - ROI tracking
+  - computational ethology
+license: MIT
+version: "0.1.0"
+date-released: "2025-10-11"
+repository-code: "https://github.com/Srujyama/Drosophila-Desire-Detector/tree/main"
+preferred-citation:
+  type: software
+  authors:
+    - family-names: "Yamali"
+      given-names: "Srujan"
+  title: "FlyFlirt: ROI-based Drosophila Behavior Analysis Toolkit"
+  year: 2025
+  version: "0.1.0"
+  url: "https://Srujanyamali.tech/FlyFlirt"
