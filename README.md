@@ -1,7 +1,3 @@
-Got it — here’s the **complete, clean, and ready-to-use `README.md`**, in full Markdown — no placeholders, no truncation, no commentary, no code fences missing.
-
----
-
 # FlyFlirt — Drosophila Behavior Analysis Toolkit
 
 **FlyFlirt** is a PyQt6-based GUI for analyzing the courtship and mating behavior of *Drosophila melanogaster* (fruit flies).
@@ -26,7 +22,7 @@ It detects, tracks, and quantifies Regions of Interest (ROIs) in videos, identif
 ### 1. Clone and install
 
 ```bash
-git clone https://github.com/yourusername/FlyFlirt.git
+git clone https://github.com/srujyama/FlyFlirt.git
 cd FlyFlirt
 
 # optional: create a virtual environment
