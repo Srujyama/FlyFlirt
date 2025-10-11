@@ -1,62 +1,33 @@
-# Fly Behavior Analysis
+# FlyFlirt — Drosophila Behavior Analysis Toolkit
 
-## Overview
-
-This project aims to analyze the behavior of flies in a video. It specifically focuses on tracking Regions of Interest (ROIs), the movement of individual flies within these regions, and detects mating events based on video data. The application is built using PyQt6 for the graphical user interface and OpenCV for video processing.
-
-## Features
-
-- **Select Video**: Allows the user to select a video file for analysis.
-- **Start/Stop Processing**: Provides buttons to start and stop video analysis.
-- **Frame and Time Information**: Displays the current frame number and time in the video.
-- **Mating Event Detection**: Detects and tracks mating events, providing both the start time and duration.
-- **Binary Image Display**: Shows a thresholded (binary) version of the video for debugging purposes.
-- **Fly Center Mating Event Detection**:  Detects and tracks mating events in the center of ROI
-- **Fly Information**: Displays detailed information about each detected fly.
-- **Fly center Info**: Displays detailed information about each detected fly.
-- **Export DataFrame**: Allows the user to export data into a CSV file.
-
-## Dependencies
-
-- Python 3.x
-- PyQt6
-- OpenCV (cv2)
-- NumPy
-- Pandas
-
-## Installation
-
-First, clone the repository:
-
-```bash
-git clone https://github.com/SomeOne1Random/drosophila-melanogaster-mating-time-finder-python
-```
-
-Then navigate to the project directory and install the required packages:
-
-```bash
-cd fly-behavior-analysis
-pip install -r requirements.txt
-```
-
-## Usage
-
-Run the main Python script:
-
-```bash
-python main.py
-```
-
-This will open the application where you can select a video and start the analysis.
-
-## Contributing
-
-Pull requests are welcome. For major changes, please open an issue first to discuss what you would like to change.
-
-## License
-
-MIT License. See `LICENSE` for more information.
+**FlyFlirt** is a PyQt6-based GUI for analyzing the courtship and mating behavior of *Drosophila melanogaster* (fruit flies).  
+It detects, tracks, and quantifies Regions of Interest (ROIs) in videos, identifies mating events, and exports structured CSV/JSON summaries for downstream behavioral analysis.
 
 ---
 
-Feel free to adapt this README to better fit your project's specific needs!
+## Key Features
+
+- **Interactive GUI:** Built with PyQt6 for easy selection, visualization, and control of videos and ROIs.  
+- **Automated ROI Detection:** Detects fly regions using OpenCV and maintains consistent labeling across frames.  
+- **Mating Event Detection:** Automatically identifies mating events and logs start times, durations, and event metadata.  
+- **Center-of-ROI Metrics:** Tracks how long flies spend near ROI centers, with gender-specific center-time measurements.  
+- **Batch Queue Mode:** Process entire directories of `.mp4` videos sequentially with queue management.  
+- **Comprehensive Exports:** Generate per-ROI CSV summaries and JSONs with coordinates, radii, and trails.  
+- **Built for Research:** Outputs are structured for reproducibility and statistical post-processing (e.g., in Pandas or R).
+
+---
+
+## uickstart
+
+### 1. Clone and install
+
+```bash
+git clone https://github.com/YourUsername/Drosophila-Desire-Detector.git
+cd Drosophila-Desire-Detector
+
+# (recommended) create a virtual environment
+python -m venv .venv
+source .venv/bin/activate   # Windows: .venv\Scripts\activate
+
+# install dependencies and CLI entrypoint
+pip install -e .
