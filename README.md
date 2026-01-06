@@ -164,7 +164,7 @@ This project is licensed under the [MIT License](LICENSE).
 
 ---
 
-## 🧠 Acknowledgments
+## Acknowledgments
 
 Developed for behavioral neuroscience and computational ethology research on *Drosophila melanogaster*.
-Inspired by previous ROI-tracking and behavioral quantification tools.
+Original Developed for Shao Lab at the University of Delaware
