@@ -106,6 +106,11 @@ All dependencies install automatically from `pyproject.toml` or `requirements.tx
 
 ```
 FlyFlirt/
+├── Video/
+│   ├── 20231201_103601_CAM0_1_Crzm_light_25._A1ACR1-CA_vf.mp4
+│   ├── 20231213_102332_CAM0_1_CSm_light_Crzvf.mp4
+│   ├── 20240227_094747_CAM0_2_Crzm_light_10.red_PC1SS1_CsChr_mfMIX_2-3do.mp4
+│   ├── 20231220_174857_CAM2_1_.mp4
 ├── flyflirt/
 │   ├── app.py              # Main GUI (your code)
 │   ├── cli.py              # CLI launcher
