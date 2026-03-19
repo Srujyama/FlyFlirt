@@ -1,15 +1,28 @@
+import json
+import os
 import sys
-from PyQt6.QtWidgets import (QApplication, QMainWindow, QPushButton, QLabel, QFileDialog, QLineEdit, QListWidget,
-                             QHBoxLayout, QMessageBox, QGroupBox,  QScrollArea, QVBoxLayout, QWidget)
-from PyQt6.QtCore import Qt, QThread, pyqtSignal
-from PyQt6.QtGui import QPixmap, QImage
+
 import cv2
 import numpy as np
 import pandas as pd
+from PyQt6.QtCore import Qt, QThread, pyqtSignal
+from PyQt6.QtGui import QImage, QPixmap
+from PyQt6.QtWidgets import (
+    QApplication,
+    QFileDialog,
+    QGroupBox,
+    QHBoxLayout,
+    QLabel,
+    QLineEdit,
+    QListWidget,
+    QMainWindow,
+    QMessageBox,
+    QPushButton,
+    QScrollArea,
+    QVBoxLayout,
+    QWidget,
+)
 from scipy import stats
-import os
-import json
-
 
 
 class VideoProcessingThread(QThread):
@@ -17,677 +30,685 @@ class VideoProcessingThread(QThread):
     frame_processed = pyqtSignal(str, np.ndarray, dict)
     frame_info = pyqtSignal(int, float)
     verified_mating_start_times = pyqtSignal(str, dict)
-    void_roi_signal = pyqtSignal(str, int)  # Signal to emit with video_path and void ROI ID
-    mating_analysis_complete = pyqtSignal(str)  # Signal to indicate completion of mating analysis
-    center_mating_duration_signal = pyqtSignal(int, float)  # ROI ID and duration in seconds
-    center_gender_duration_signal = pyqtSignal(int, float, float)  # ROI ID, male duration, female duration
+    void_roi_signal = pyqtSignal(str, int)
+    mating_analysis_complete = pyqtSignal(str)
+    center_mating_duration_signal = pyqtSignal(int, float)   # ROI ID, duration (s)
+    center_gender_duration_signal = pyqtSignal(int, float, float)  # ROI ID, male (s), female (s)
+    # Fix 1: flies_count_signal must be a class-level attribute, not assigned in __init__
+    flies_count_signal = pyqtSignal(str, int, int)
 
     def __init__(self, video_path, initial_contours, fps, skip_frames=0, perf_frame_skips=1):
         super().__init__()
         self.video_path = video_path
         self.initial_contours = initial_contours
         self.is_running = False
-        self.roi_ids = {}  # Dictionary to store ROI IDs
-        self.mating_start_times = {}  # Dictionary to store mating start times for each ROI
-        self.mating_durations = {}  # Dictionary to store mating durations for each ROI
+        self.roi_ids = {}
+        self.mating_start_times = {}
+        self.mating_durations = {}          # roi_id -> current duration (float, not list)
         self.fps = fps
-        self.mating_start_frames = {}  # Dictionary to store mating start frames for each ROI
-        self.mating_grace_frames = {}  # Dictionary to store grace frames for each ROI
-        self.mating_start_times_df = pd.DataFrame(columns=['ROI', 'Start Times'])  # Create an empty DataFrame to store mating start times
-        self.latest_frames = {}  # Stores the latest frame for each video
-        self.latest_mating_durations = {}  # Stores the latest mating durations for each video
-        self.flies_count_signal = pyqtSignal(str, int,
-                                             int)  # Signal to be emitted with video_path, ROI ID, and flies count
-        self.flies_count_per_ROI = {}  # Tracks the count of flies per ROI
-        self.void_rois = {}  # Dictionary to store void ROIs
-        self.skip_frames = skip_frames  # Number of frames to skip from the beginning
-        self.previous_flies_count_per_ROI = {}  # Tracks previous frame's fly count per ROI
-        self.mating_event_detected = {}  # Tracks if a mating event is detected in an ROI
-        self.previous_fly_positions_per_ROI = {}  # Tracks previous frame's fly positions per ROI when there are two flies
-        self.mating_status_per_ROI = {}  # New dictionary to store mating status for each ROI
-        self.mating_event_ongoing = {}  # Tracks ongoing mating events for each ROI
+        self.mating_start_frames = {}
+        self.mating_grace_frames = {}
+        self.flies_count_per_ROI = {}
+        self.void_rois = {}
+        self.skip_frames = skip_frames
+        self.previous_fly_positions_per_ROI = {}
+        self.mating_event_detected = {}
+        self.mating_status_per_ROI = {}
+        self.mating_event_ongoing = {}
         self.perf_frame_skips = perf_frame_skips
         self.roi_centers = {}
-        self.center_mating_frames_count = {}  # Tracks count of center-mating frames for each ROI
-        self.center_mating_duration = {}  # Dictionary to store the longest center mating duration for each ROI
+        self.center_mating_duration = {}    # roi_id -> running total (float)
         self.center_mating_start_frame = {}
         self.center_mating_event_end_threshold = 3
         self.fly_size_history = {}
         self.fly_position_history = {}
         self.fly_trail_history = {}
-        self.center_gender_duration = {}  # Initialize the dictionary to store center duration for each gender
-        self.pre_mating_center_gender_duration = {}  # Initialize the dictionary to store pre-mating center duration for each gender
+        self.center_gender_duration = {}
+        self.pre_mating_center_gender_duration = {}
         self.roi_details = {}
-
-
-    def export_combined_mating_times(self):
-        combined_mating_times = {}
-
-        for roi_id, mating_time in self.mating_start_times.items():
-            # Check if this mating time is within 1 second of another mating time
-            is_combined = False
-            for combined_id, combined_time in combined_mating_times.items():
-                if abs(mating_time - combined_time) <= 1:
-                    combined_mating_times[combined_id] = (combined_time + mating_time) / 2
-                    is_combined = True
-                    break
-
-            if not is_combined:
-                combined_mating_times[roi_id] = mating_time
-
-        # Create a DataFrame from the combined mating times
-        combined_mating_df = pd.DataFrame(list(combined_mating_times.items()), columns=['ROI', 'Start Time'])
-        combined_mating_df['Mating Duration'] = [self.mating_durations.get(roi_id, 0) for roi_id in
-                                                 combined_mating_df['ROI']]
-
-        return combined_mating_df
+        # Fix 2: separate raw-frame counter from processed-frame counter
+        self._processed_frame_count = 0
 
     def run(self):
         self.is_running = True
-        self.flies_count_per_ROI.clear()  # Reset flies count per ROI when a new video starts
+        self.flies_count_per_ROI.clear()
 
         cap = cv2.VideoCapture(self.video_path)
 
-        # Skip the specified number of frames
+        # Skip the specified number of frames from the start
         for _ in range(self.skip_frames):
             ret, _ = cap.read()
             if not ret:
                 break
 
-        frame_count = 0
-        current_frame = 0
+        raw_frame_index = 0
+        self._processed_frame_count = 0
+
         while self.is_running:
             ret, frame = cap.read()
             if not ret:
                 break
 
-            if current_frame % self.perf_frame_skips == 0:
+            # Fix 2: only process every nth raw frame; threshold checks use processed count
+            if raw_frame_index % self.perf_frame_skips == 0:
+                self.frame_info.emit(raw_frame_index, raw_frame_index / self.fps)
 
-                self.process_frame(frame, self.initial_contours, current_frame)  # or any other value for frame_count
-                self.frame_info.emit(current_frame, current_frame / self.fps)
-
-                # Process the frame here
-                processed_frame, masks = self.process_frame(frame, self.initial_contours, frame_count)
-                self.detect_flies(processed_frame, masks, frame_count)
-
-                # Emit the video path along with the processed frame and the mating durations
-                self.frame_processed.emit(self.video_path, processed_frame, self.mating_durations)
+                processed_frame, masks = self.process_frame(
+                    frame, self.initial_contours, self._processed_frame_count
+                )
+                self.detect_flies(processed_frame, masks, self._processed_frame_count)
 
                 for roi_id, is_mating in self.mating_event_ongoing.items():
                     self.mating_status_per_ROI[roi_id] = is_mating
 
-            current_frame += 1
-            frame_count += 1
+                self._processed_frame_count += 1
 
-        self.mating_analysis_complete.emit(self.video_path)  # Emit signal indicating completion
+            raw_frame_index += 1
 
+        self.mating_analysis_complete.emit(self.video_path)
         cap.release()
         self.finished.emit()
 
     def stop(self):
         self.is_running = False
 
-    def process_frame(self, frame, initial_contours, frame_count):
-        # Define padding size (you can adjust these values as needed)
-        top_padding, bottom_padding, left_padding, right_padding = 50, 50, 50, 50  # Example padding sizes
+    def process_frame(self, frame, initial_contours, processed_frame_count):
+        top_padding = bottom_padding = left_padding = right_padding = 50
 
-        # Add black padding to the frame
-        frame_with_padding = cv2.copyMakeBorder(frame, top_padding, bottom_padding, left_padding, right_padding,
-                                                cv2.BORDER_CONSTANT, value=[0, 0, 0])
+        frame_with_padding = cv2.copyMakeBorder(
+            frame,
+            top_padding, bottom_padding, left_padding, right_padding,
+            cv2.BORDER_CONSTANT,
+            value=[0, 0, 0],
+        )
 
-        # Convert frame to grayscale
         gray = cv2.cvtColor(frame_with_padding, cv2.COLOR_BGR2GRAY)
-
-        # Threshold the image to obtain a binary image
         _, thresh = cv2.threshold(gray, 127, 255, cv2.THRESH_BINARY)
-
-        # Find contours of white regions
         contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
-        # Define a custom sorting function
         def custom_sort(contour):
             x, y, w, h = cv2.boundingRect(contour)
-            y_tolerance = 200  # Adjust this tolerance as needed
-            return (y // y_tolerance) * 1000 + x  # Sort primarily by y (with tolerance), and then by x
+            y_tolerance = 200
+            return (y // y_tolerance) * 1000 + x
 
-        # Convert contours to a list and sort based on x-coordinate of their bounding rectangles
-        contours_list = list(contours)
+        contours_list = sorted(list(contours), key=custom_sort)
 
-        # Sort the contours using the custom sorting function
-        contours_list.sort(key=custom_sort)
-
-        # Store initial contours if frame_count
-        if frame_count <= 500:
-            initial_contours.clear()
-            self.roi_ids.clear()  # Clear ROI IDs
-            for i, contour in enumerate(contours_list):
+        # Fix 6: build ROI list incrementally during the first 500 *processed* frames,
+        # but do NOT clear on every frame — only update if a better set is found.
+        # We accumulate a candidate list and commit it once the window closes.
+        if processed_frame_count < 500:
+            # Rebuild candidate contours from this frame
+            candidate = []
+            for contour in contours_list:
                 area = cv2.contourArea(contour)
-                if area > 500:  # Minimum area threshold to filter out noise
-                    initial_contours.append({"contour": contour, "edge_duration": 0})
-                    contour_id = self.generate_contour_id(contour)
-                    self.roi_ids[contour_id] = i + 1  # Assign ID to ROI
+                if area > 500:
+                    candidate.append({"contour": contour, "edge_duration": 0})
+            # Only replace if we found at least as many ROIs as before
+            if len(candidate) >= len(initial_contours):
+                initial_contours.clear()
+                initial_contours.extend(candidate)
+                # Fix 5+7: use 0-based index as ROI ID (consistent with all other dicts)
+                self.roi_ids.clear()
+                for i, cd in enumerate(initial_contours):
+                    self.roi_ids[i] = i
         else:
-            # Check for contours near the edges
+            # After initialization: track edge proximity for each known ROI
             for contour_data in initial_contours:
                 contour = contour_data["contour"]
-                (x, y, w, h) = cv2.boundingRect(contour)
-                if x <= 5 or y <= 5 or (x + w) >= frame_with_padding.shape[1] - 5 or (y + h) >= \
-                        frame_with_padding.shape[0] - 5:
+                x, y, w, h = cv2.boundingRect(contour)
+                if (
+                    x <= 5
+                    or y <= 5
+                    or (x + w) >= frame_with_padding.shape[1] - 5
+                    or (y + h) >= frame_with_padding.shape[0] - 5
+                ):
                     contour_data["edge_duration"] += 1
                 else:
                     contour_data["edge_duration"] = 0
 
-        # Calculate and round radii to find the mode radius
+        # Calculate mode radius across all ROIs
         radii = []
         for contour_data in initial_contours:
-            (x, y, w, h) = cv2.boundingRect(contour_data["contour"])
+            x, y, w, h = cv2.boundingRect(contour_data["contour"])
             radii.append(int(round((w + h) / 4)))
+        mode_radius = int(stats.mode(radii)[0]) if radii else 0
 
-        mode_radius = int(stats.mode(radii)[0]) if radii else 0  # Default to 0 if radii list is empty
-
-        # Create masks and draw green circles using mode radius
+        # Create masks and draw ROI circles
         masks = []
         processed_frame = frame_with_padding.copy()
         for contour_data in initial_contours:
-            (x, y, w, h) = cv2.boundingRect(contour_data["contour"])
+            x, y, w, h = cv2.boundingRect(contour_data["contour"])
             center_x = int(x + w / 2)
             center_y = int(y + h / 2)
 
-            # Create mask with circle
             mask = np.zeros(processed_frame.shape[:2], dtype="uint8")
             cv2.circle(mask, (center_x, center_y), mode_radius, (255,), -1)
             masks.append(mask)
 
-            # Draw circle on processed frame
-            if (x > 5 and y > 5 and (x + w) < frame_with_padding.shape[1] - 5 and (y + h) < frame_with_padding.shape[
-                0] - 5) or contour_data["edge_duration"] >= 90:
+            if (
+                x > 5
+                and y > 5
+                and (x + w) < frame_with_padding.shape[1] - 5
+                and (y + h) < frame_with_padding.shape[0] - 5
+            ) or contour_data["edge_duration"] >= 90:
                 cv2.circle(processed_frame, (center_x, center_y), mode_radius, (0, 255, 0), 2)
 
-        # Draw ROI numbers
+        # Draw ROI numbers and store roi_details
         for i, contour_data in enumerate(initial_contours):
-            # Example of calculating the radius from the contour (simplified)
-            radius = max(w, h) / 2  # Use the maximum of width and height to ensure the circle covers the object
-
-            # Update or add the radius to your data structure, e.g., self.roi_details
-            self.roi_details[i] = {
-                'center': (int(x + w / 2), int(y + h / 2)),
-                'radius': radius
-            }
-
-            (x, y, w, h) = cv2.boundingRect(contour_data["contour"])
+            # Fix 5: compute bounding rect at top of loop (was using stale x,y,w,h)
+            x, y, w, h = cv2.boundingRect(contour_data["contour"])
             center_x = int(x + w / 2)
             center_y = int(y + h / 2)
+            radius = max(w, h) / 2
 
-            # Inside process_frame, in the loop where circles are drawn
-            self.roi_centers[i] = (center_x, center_y)  # Store the center for each ROI
+            self.roi_details[i] = {"center": (center_x, center_y), "radius": radius}
+            self.roi_centers[i] = (center_x, center_y)
 
-            # Determine position for ROI number
             text_position = (center_x, center_y - 55)
-            cv2.putText(processed_frame, str(i), text_position, cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 105, 180), 2,
-                        cv2.LINE_AA)
+            # Fix 8: label matches 0-based index used everywhere else
+            cv2.putText(
+                processed_frame,
+                str(i),
+                text_position,
+                cv2.FONT_HERSHEY_SIMPLEX,
+                1,
+                (255, 105, 180),
+                2,
+                cv2.LINE_AA,
+            )
 
         return processed_frame, masks
 
-    def detect_flies(self, frame_with_padding, masks, frame_count):
+    def detect_flies(self, frame_with_padding, masks, processed_frame_count):
         params = cv2.SimpleBlobDetector_Params()
         params.filterByArea = True
         params.minArea = 1
         params.filterByCircularity = False
         params.filterByConvexity = False
         params.filterByInertia = False
-
-        # Create blob detector
         detector = cv2.SimpleBlobDetector_create(params)
 
-        # Define radius and thickness for drawing circles
-        radius = 6  # Increase the radius for larger dots
-        thickness = -1  # Set the thickness to a negative value for a hollow circle
+        dot_radius = 6
+        dot_thickness = -1
 
-        grace_frames_threshold = int(self.fps * 10 / self.perf_frame_skips)  # Assuming 1 second of real-time
+        grace_frames_threshold = int(self.fps * 10 / self.perf_frame_skips)
+        center_threshold = 32
 
-        center_threshold = 32  # Define a threshold for how close to the center is considered 'in the center'
-
-        # Iterate through each mask and detect flies
         for i, mask in enumerate(masks):
-            # If an ROI has been marked as void, continue to the next ROI
             if self.void_rois.get(i, False):
                 continue
 
-            # Apply the mask to the frame
             masked_frame = cv2.bitwise_and(frame_with_padding, frame_with_padding, mask=mask)
-
-            # Convert the masked frame to grayscale (if not already done)
             gray = cv2.cvtColor(masked_frame, cv2.COLOR_BGR2GRAY)
 
-            # Kernel for morphological operations
             kernel = np.ones((6, 6), np.uint8)
-
-            # Apply morphological operations to close gaps and make blobs stick together
             gray = cv2.morphologyEx(gray, cv2.MORPH_CLOSE, kernel, iterations=1)
-            gray = cv2.morphologyEx(gray, cv2.MORPH_DILATE, kernel, iterations=1)  # Stronger dilation
-            gray = cv2.morphologyEx(gray, cv2.MORPH_ERODE, kernel, iterations=1)  # Stronger erosion
+            gray = cv2.morphologyEx(gray, cv2.MORPH_DILATE, kernel, iterations=1)
+            gray = cv2.morphologyEx(gray, cv2.MORPH_ERODE, kernel, iterations=1)
 
-            # Continue with the existing blob detection
             keypoints = detector.detect(gray)
 
-            # Initialize or update the trail history for each ROI
             if i not in self.fly_trail_history:
                 self.fly_trail_history[i] = []
 
-            # Get the center of the current ROI
             roi_center = self.roi_centers.get(i, (0, 0))
 
-            # Draw the threshold boundary around the center of the ROI
-            cv2.circle(frame_with_padding, roi_center, center_threshold, (255, 0, 255), 2)  # Drawing a magenta circle
+            cv2.circle(frame_with_padding, roi_center, center_threshold, (255, 0, 255), 2)
 
-            # Detect flies count for the first 500 frames
-            if frame_count < 500:
+            # ----------------------------------------------------------------
+            # Calibration window: detect fly count and check for void ROIs
+            # Fix 3: use processed_frame_count so threshold counts processed frames
+            # ----------------------------------------------------------------
+            if processed_frame_count < 500:
                 flies_count = len(keypoints)
-                current_positions = [keypoint.pt for keypoint in keypoints]
+                current_positions = [kp.pt for kp in keypoints]
 
-                # Check for mating event when there's a transition from two to one fly
+                # Detect 2→1 transition as a mating event signal
                 if flies_count == 1 and i in self.previous_fly_positions_per_ROI:
                     prev_positions = self.previous_fly_positions_per_ROI[i]
-                    # Ensure prev_positions has exactly two elements
                     if len(prev_positions) == 2:
-                        distance_between_flies = np.linalg.norm(
-                            np.array(prev_positions[0]) - np.array(prev_positions[1]))
-                        if distance_between_flies > 30:
+                        dist = np.linalg.norm(
+                            np.array(prev_positions[0]) - np.array(prev_positions[1])
+                        )
+                        if dist > 30:
                             self.mating_event_detected[i] = True
-                    # Clear the stored positions after checking
-                    del self.previous_fly_positions_per_ROI[i]
 
-                # Only store positions when there are exactly two flies
-                elif flies_count == 2:
+                # Fix 4: only store positions when there are exactly 2 flies;
+                # do NOT unconditionally overwrite at the end of the block.
+                if flies_count == 2:
                     self.previous_fly_positions_per_ROI[i] = current_positions
+                elif flies_count == 1 and i in self.previous_fly_positions_per_ROI:
+                    # Keep the last 2-fly positions for transition detection;
+                    # delete only after we've already used them above.
+                    del self.previous_fly_positions_per_ROI[i]
 
                 if i not in self.flies_count_per_ROI:
                     self.flies_count_per_ROI[i] = []
                 self.flies_count_per_ROI[i].append(flies_count)
 
-                self.previous_fly_positions_per_ROI[i] = current_positions
-
-                # Check the condition after 200 frames
                 if len(self.flies_count_per_ROI[i]) == 200:
-                    more_than_two_count = sum(count > 2 for count in self.flies_count_per_ROI[i])
-                    less_than_two_count = sum(count < 2 for count in self.flies_count_per_ROI[i])
-
-                    # Calculate 75% of 200 frames
+                    more_than_two = sum(c > 2 for c in self.flies_count_per_ROI[i])
+                    less_than_two = sum(c < 2 for c in self.flies_count_per_ROI[i])
                     threshold = 200 * 0.75
-
-                    # Adjust the logic to not mark the ROI as void if a mating event is detected
-                    if more_than_two_count > threshold or (
-                            less_than_two_count > threshold and not self.mating_event_detected.get(i, False)):
+                    if more_than_two > threshold or (
+                        less_than_two > threshold
+                        and not self.mating_event_detected.get(i, False)
+                    ):
                         self.void_rois[i] = True
-                        self.void_roi_signal.emit(self.video_path, i)  # Emit the signal
+                        self.void_roi_signal.emit(self.video_path, i)
 
-                # Mating event detection and handling
-            if len(keypoints) == 1:  # A mating event is occurring
-                if self.mating_durations.get(i, []) and max(self.mating_durations[i]) >= 360 and \
-                        not self.mating_event_ongoing[i] and self.mating_grace_frames.get(i,
-                                                                                          0) > grace_frames_threshold:
+            # ----------------------------------------------------------------
+            # Mating event detection and tracking
+            # ----------------------------------------------------------------
+
+            # Fix 10: ensure mating_event_ongoing always has a value for this ROI
+            if i not in self.mating_event_ongoing:
+                self.mating_event_ongoing[i] = False
+
+            if len(keypoints) == 1:
+                # Skip if mating already confirmed + ended + grace period expired
+                if (
+                    i in self.mating_start_times
+                    and not self.mating_event_ongoing.get(i, False)
+                    and self.mating_grace_frames.get(i, 0) > grace_frames_threshold
+                ):
                     continue
 
                 self.mating_event_ongoing[i] = True
 
                 x, y = int(keypoints[0].pt[0]), int(keypoints[0].pt[1])
-                self.fly_trail_history[i].append((x, y))
 
-                # Draw the trail if there are enough points
-                if len(self.fly_trail_history[i]) > 1:
-                    for j in range(len(self.fly_trail_history[i]) - 1):
-                        # Draw lines connecting consecutive points
-                        cv2.line(frame_with_padding, self.fly_trail_history[i][j], self.fly_trail_history[i][j + 1],
-                                 (0, 255, 0), 2)
-
-                # Start timing the mating event if not already started
                 if i not in self.mating_start_frames:
-                    self.mating_start_frames[i] = frame_count
+                    self.mating_start_frames[i] = processed_frame_count
 
-                # Reset grace frames counter for this ROI
                 self.mating_grace_frames[i] = 0
 
-                # Calculate the duration of the mating event in frames and convert to seconds
-                mating_duration = (frame_count - self.mating_start_frames[i]) / self.fps
-                self.mating_durations.setdefault(i, []).append(mating_duration)  # Store duration in list per ROI
+                # Fix 11: overwrite current duration instead of appending every frame
+                mating_duration = (
+                    processed_frame_count - self.mating_start_frames[i]
+                ) / self.fps
+                self.mating_durations[i] = mating_duration
 
-                # If mating duration exceeds 60 seconds and this ROI doesn't have a verified mating start time yet
+                # Fix 12: record the actual start time, not the confirmation time
                 if mating_duration >= 360 and i not in self.mating_start_times:
-                    self.mating_durations[i] = [max(self.mating_durations[
-                                                        i])]  # Keep the longest duration only
-                    mating_time = frame_count / self.fps
-                    self.mating_start_times[i] = mating_time
-                    # Emit the verified mating start times
-                    self.verified_mating_start_times.emit(self.video_path, self.mating_start_times)
+                    actual_start_time = self.mating_start_frames[i] / self.fps
+                    self.mating_start_times[i] = actual_start_time
+                    self.verified_mating_start_times.emit(
+                        self.video_path, self.mating_start_times
+                    )
 
-                x, y = int(keypoints[0].pt[0]), int(keypoints[0].pt[1])
-                distance_to_center = np.sqrt((x - roi_center[0]) ** 2 + (y - roi_center[1]) ** 2)
+                # Confirmed mating trail: only record/draw after 360s confirmed
+                confirmed_mating = mating_duration >= 360 or i in self.mating_start_times
+                if confirmed_mating:
+                    if i not in self.mating_start_times:
+                        # First confirmation frame — clear any pre-confirmation points
+                        self.fly_trail_history[i] = []
+                    self.fly_trail_history[i].append((x, y))
+
+                if len(self.fly_trail_history[i]) > 1:
+                    for j in range(len(self.fly_trail_history[i]) - 1):
+                        cv2.line(
+                            frame_with_padding,
+                            self.fly_trail_history[i][j],
+                            self.fly_trail_history[i][j + 1],
+                            (0, 255, 0),
+                            2,
+                        )
+
+                # Center mating duration tracking
+                distance_to_center = np.sqrt(
+                    (x - roi_center[0]) ** 2 + (y - roi_center[1]) ** 2
+                )
                 in_center = distance_to_center <= center_threshold
 
                 if in_center:
                     if i not in self.center_mating_start_frame:
-                        self.center_mating_start_frame[i] = frame_count
+                        self.center_mating_start_frame[i] = processed_frame_count
                     else:
-                        # Calculate the duration of the center mating event
-                        duration = frame_count - self.center_mating_start_frame[i]
-                        # Convert duration to seconds
-                        duration_in_seconds = duration / self.fps
-
-                        # Ensure the key exists
+                        interval = (
+                            processed_frame_count - self.center_mating_start_frame[i]
+                        ) / self.fps
+                        # Fix 29: maintain a running total instead of a list + sum
                         if i not in self.center_mating_duration:
-                            self.center_mating_duration[i] = []
-
-                        # Check if the mating event is still ongoing
-                        if self.mating_event_ongoing[i]:
-                            # Now append the duration
-                            self.center_mating_duration[i].append(duration_in_seconds)
-
-                            # Sum up all durations for the current ROI to get the total duration, if the key exists
-                            if i in self.center_mating_duration:
-                                total_duration = sum(self.center_mating_duration[i])
-                                self.center_mating_duration_signal.emit(i, total_duration)
-
-                        # Reset the start frame for the next center mating event
-                        self.center_mating_start_frame[i] = frame_count
+                            self.center_mating_duration[i] = 0.0
+                        self.center_mating_duration[i] += interval
+                        self.center_mating_duration_signal.emit(
+                            i, self.center_mating_duration[i]
+                        )
+                        self.center_mating_start_frame[i] = processed_frame_count
                 else:
-                    # Check if the center mating event has exceeded the threshold
+                    # Fix 9: do NOT set mating_event_ongoing=False here.
+                    # The pair has just drifted away from center — mating is still ongoing.
+                    # Only reset the center-proximity start frame.
                     if i in self.center_mating_start_frame:
-                        duration_since_last_event = frame_count - self.center_mating_start_frame[i]
-                        if duration_since_last_event > self.center_mating_event_end_threshold:
-                            # Reset the start frame for the next event, instead of deleting it
-                            self.center_mating_start_frame[i] = frame_count
-                            self.mating_event_ongoing[i] = False
-                            if i in self.mating_durations and any(
-                                        duration >= 360 for duration in self.mating_durations[i]):
-                                    pass
-                            else:
-                                self.fly_trail_history[i] = []
+                        duration_since_center = (
+                            processed_frame_count - self.center_mating_start_frame[i]
+                        )
+                        if duration_since_center > self.center_mating_event_end_threshold:
+                            self.center_mating_start_frame[i] = processed_frame_count
 
-
-
-            else:  # Mating event has potentially ended
+            else:
+                # Mating event has potentially ended
                 self.mating_event_ongoing[i] = False
                 self.mating_grace_frames[i] = self.mating_grace_frames.get(i, 0) + 1
 
                 if i in self.mating_start_frames:
-                    mating_duration = (frame_count - self.mating_start_frames[i]) / self.fps
-                    # Check the duration of the mating event and delete center mating durations if necessary
+                    mating_duration = (
+                        processed_frame_count - self.mating_start_frames[i]
+                    ) / self.fps
                     if mating_duration < 360 and i in self.center_mating_duration:
                         del self.center_mating_duration[i]
 
-                # If grace frames counter exceeds threshold, consider the mating event to have ended
-                if self.mating_grace_frames[i] > grace_frames_threshold:
+                # Fix 10: use .get() to avoid KeyError after deletion
+                if self.mating_grace_frames.get(i, 0) > grace_frames_threshold:
                     if i in self.mating_start_frames:
                         del self.mating_start_frames[i]
+                    if i in self.mating_grace_frames:
                         del self.mating_grace_frames[i]
+                    # Clear unconfirmed trail
+                    if i not in self.mating_start_times:
+                        self.fly_trail_history[i] = []
 
-                # Initialize or update tracking information
+            # ----------------------------------------------------------------
+            # Per-ROI fly identity & gender tracking (2-fly frames)
+            # ----------------------------------------------------------------
             if i not in self.fly_size_history:
-                self.fly_size_history[i] = {'male': [], 'female': []}  # Stores size history for male and female
-                self.fly_position_history[i] = {'female': []}  # Stores position history for the female fly
+                self.fly_size_history[i] = {"slot0": [], "slot1": []}
+                self.fly_position_history[i] = {"female": []}
 
             if len(keypoints) == 2:
-                # Sort keypoints by size (area)
-                sorted_keypoints = sorted(keypoints, key=lambda k: k.size, reverse=True)
-                female_fly, male_fly = sorted_keypoints
+                size_history_limit = 30
 
-                # Update size history
-                self.fly_size_history[i]['female'].append(female_fly.size)
-                self.fly_size_history[i]['male'].append(male_fly.size)
+                prev_slots = self.fly_position_history[i].get("_slots")
+                kp_pts = [np.array(kp.pt) for kp in keypoints]
 
-                # Maintain size history only for the last N frames
-                size_history_limit = 20
-                for gender in ['male', 'female']:
-                    if len(self.fly_size_history[i][gender]) > size_history_limit:
-                        self.fly_size_history[i][gender].pop(0)
-
-                # Determine gender based on average size over history
-                average_female_size = np.mean(self.fly_size_history[i]['female'])
-                average_male_size = np.mean(self.fly_size_history[i]['male'])
-
-                if average_female_size > average_male_size:
-                    # Update female fly position history
-                    self.fly_position_history[i]['female'].append((int(female_fly.pt[0]), int(female_fly.pt[1])))
+                if prev_slots is not None and len(prev_slots) == 2:
+                    prev0, prev1 = np.array(prev_slots[0]), np.array(prev_slots[1])
+                    d00 = np.linalg.norm(kp_pts[0] - prev0)
+                    d01 = np.linalg.norm(kp_pts[0] - prev1)
+                    d10 = np.linalg.norm(kp_pts[1] - prev0)
+                    d11 = np.linalg.norm(kp_pts[1] - prev1)
+                    if d00 + d11 <= d01 + d10:
+                        slot0_kp, slot1_kp = keypoints[0], keypoints[1]
+                    else:
+                        slot0_kp, slot1_kp = keypoints[1], keypoints[0]
                 else:
-                    # If the male becomes larger, swap the labels
-                    self.fly_position_history[i]['female'].append((int(male_fly.pt[0]), int(male_fly.pt[1])))
+                    sorted_by_size = sorted(keypoints, key=lambda k: k.size, reverse=True)
+                    slot0_kp, slot1_kp = sorted_by_size[0], sorted_by_size[1]
 
-                # Maintain position history only for the last 100 frames
-                if len(self.fly_position_history[i]['female']) > 10:
-                    self.fly_position_history[i]['female'].pop(0)
+                self.fly_position_history[i]["_slots"] = [
+                    (int(slot0_kp.pt[0]), int(slot0_kp.pt[1])),
+                    (int(slot1_kp.pt[0]), int(slot1_kp.pt[1])),
+                ]
 
-                # Draw lines for the female fly
-                for p1, p2 in zip(self.fly_position_history[i]['female'], self.fly_position_history[i]['female'][1:]):
-                    cv2.line(frame_with_padding, p1, p2, (255, 0, 0), 2)  # Blue line for the female fly
+                self.fly_size_history[i]["slot0"].append(slot0_kp.size)
+                self.fly_size_history[i]["slot1"].append(slot1_kp.size)
+                for slot in ["slot0", "slot1"]:
+                    if len(self.fly_size_history[i][slot]) > size_history_limit:
+                        self.fly_size_history[i][slot].pop(0)
 
-                # Draw keypoints with updated gender labels
-                cv2.circle(frame_with_padding, (int(female_fly.pt[0]), int(female_fly.pt[1])), radius, (0, 0, 255),
-                           thickness)  # Red for female
-                cv2.circle(frame_with_padding, (int(male_fly.pt[0]), int(male_fly.pt[1])), radius, (255, 255, 0),
-                           thickness)  # Yellow for male
+                min_history = 10
+                avg0 = np.mean(self.fly_size_history[i]["slot0"])
+                avg1 = np.mean(self.fly_size_history[i]["slot1"])
+                enough_history = (
+                    len(self.fly_size_history[i]["slot0"]) >= min_history
+                    and len(self.fly_size_history[i]["slot1"]) >= min_history
+                )
 
-                for fly, gender in zip(sorted_keypoints, ['female', 'male']):
-                    x, y = int(fly.pt[0]), int(fly.pt[1])
-                    distance_to_center = np.sqrt((x - roi_center[0]) ** 2 + (y - roi_center[1]) ** 2)
-                    in_center = distance_to_center <= center_threshold
+                if enough_history:
+                    if avg0 >= avg1:
+                        female_fly, male_fly = slot0_kp, slot1_kp
+                    else:
+                        female_fly, male_fly = slot1_kp, slot0_kp
+                else:
+                    if slot0_kp.size >= slot1_kp.size:
+                        female_fly, male_fly = slot0_kp, slot1_kp
+                    else:
+                        female_fly, male_fly = slot1_kp, slot0_kp
 
-                    # Initialize the nested dictionary if necessary
+                sorted_keypoints = [female_fly, male_fly]
+
+                self.fly_position_history[i]["female"].append(
+                    (int(female_fly.pt[0]), int(female_fly.pt[1]))
+                )
+                if len(self.fly_position_history[i]["female"]) > 10:
+                    self.fly_position_history[i]["female"].pop(0)
+
+                # Draw female trail
+                for p1, p2 in zip(
+                    self.fly_position_history[i]["female"],
+                    self.fly_position_history[i]["female"][1:],
+                ):
+                    cv2.line(frame_with_padding, p1, p2, (255, 0, 0), 2)
+
+                cv2.circle(
+                    frame_with_padding,
+                    (int(female_fly.pt[0]), int(female_fly.pt[1])),
+                    dot_radius, (0, 0, 255), dot_thickness,
+                )
+                cv2.circle(
+                    frame_with_padding,
+                    (int(male_fly.pt[0]), int(male_fly.pt[1])),
+                    dot_radius, (255, 255, 0), dot_thickness,
+                )
+
+                for fly, gender in zip(sorted_keypoints, ["female", "male"]):
+                    fx, fy = int(fly.pt[0]), int(fly.pt[1])
+                    dist = np.sqrt((fx - roi_center[0]) ** 2 + (fy - roi_center[1]) ** 2)
+                    in_center = dist <= center_threshold
+
                     if i not in self.pre_mating_center_gender_duration:
-                        self.pre_mating_center_gender_duration[i] = {'male': 0, 'female': 0}
+                        self.pre_mating_center_gender_duration[i] = {"male": 0.0, "female": 0.0}
+                    if i not in self.center_gender_duration:
+                        self.center_gender_duration[i] = {"male": 0.0, "female": 0.0}
 
                     if not self.mating_event_ongoing.get(i, False) and in_center:
-                        if all(duration < 360 for duration in self.mating_durations.get(i, [])):
-                            self.pre_mating_center_gender_duration[i][
-                                gender] += 1 / self.fps  # Convert frame count to seconds
-
-                    # Initialize the nested dictionary if necessary
-                    if i not in self.center_gender_duration:
-                        self.center_gender_duration[i] = {'male': 0, 'female': 0}
+                        if self.mating_durations.get(i, 0) < 360:
+                            self.pre_mating_center_gender_duration[i][gender] += 1.0 / self.fps
 
                     if in_center:
-                        # Increment the center duration for the respective gender
-                        self.center_gender_duration[i][gender] += 1 / self.fps  # Convert frame count to seconds
+                        self.center_gender_duration[i][gender] += 1.0 / self.fps
+                        self.center_gender_duration_signal.emit(
+                            i,
+                            self.center_gender_duration[i]["male"],
+                            self.center_gender_duration[i]["female"],
+                        )
 
-                        # Emit the center gender duration signal
-                        male_duration = self.center_gender_duration[i]['male']
-                        female_duration = self.center_gender_duration[i]['female']
-                        self.center_gender_duration_signal.emit(i, male_duration, female_duration)
-
-
-            # Draw dots on the frame for each detected fly (centroid)
+            # Draw dots for all detected flies
             for keypoint in keypoints:
-                x = int(keypoint.pt[0])
-                y = int(keypoint.pt[1])
-
-                # Calculate the distance from the fly to the center of the ROI
-                distance_to_center = np.sqrt((x - roi_center[0]) ** 2 + (y - roi_center[1]) ** 2)
-
-                # Determine the color based on mating status, grace frame status, and proximity to center
-                in_center = distance_to_center <= center_threshold
+                kx = int(keypoint.pt[0])
+                ky = int(keypoint.pt[1])
+                dist = np.sqrt((kx - roi_center[0]) ** 2 + (ky - roi_center[1]) ** 2)
+                in_center = dist <= center_threshold
                 mating_ongoing = self.mating_event_ongoing.get(i, False)
-                within_grace_period = self.mating_grace_frames.get(i, 0) <= grace_frames_threshold
+                within_grace = self.mating_grace_frames.get(i, 0) <= grace_frames_threshold
 
-                if mating_ongoing or within_grace_period:
-                    mating_duration = self.mating_durations.get(i, [0])[-1]  # Get the latest duration
-
-                    if mating_duration < 360:
-                        color = (0, 255, 255)  # Yellow dot
-                    else:
-                        color = (255, 0, 0)  # Blue dot
+                if mating_ongoing or within_grace:
+                    current_dur = self.mating_durations.get(i, 0)
+                    color = (255, 0, 0) if current_dur >= 360 else (0, 255, 255)
                 else:
-                    color = (0, 0, 255)  # Red dot for flies not in mating or grace period
+                    color = (0, 0, 255)
 
-                # Change color if the fly is in the center
                 if in_center:
-                    color = (0, 255, 0)  # Green color for flies in the center
+                    color = (0, 255, 0)
 
-                cv2.circle(frame_with_padding, (x, y), radius, color, thickness)
+                cv2.circle(frame_with_padding, (kx, ky), dot_radius, color, dot_thickness)
 
-        self.frame_processed.emit(self.video_path, frame_with_padding, self.mating_durations)
+        # Fix 23: emit a copy of the frame so the main thread holds a stable buffer
+        self.frame_processed.emit(
+            self.video_path, frame_with_padding.copy(), self.mating_durations.copy()
+        )
 
     def generate_contour_id(self, contour):
-        return cv2.contourArea(contour)
+        # Fix 5: use centroid as a more unique identifier than area alone
+        M = cv2.moments(contour)
+        if M["m00"] == 0:
+            return (0, 0)
+        cx = int(M["m10"] / M["m00"])
+        cy = int(M["m01"] / M["m00"])
+        return (cx, cy)
 
     def void_roi(self, roi_id):
         self.void_rois[roi_id] = True
-        self.void_roi_signal.emit(self.video_path, roi_id)  # Emit the signal to indicate a void ROI
+        self.void_roi_signal.emit(self.video_path, roi_id)
 
     def export_roi_locations(self):
         video_info = {
-            'video_path': self.video_path,
-            'video_dimensions': {
-                'width': None,
-                'height': None
+            "video_path": self.video_path,
+            "video_dimensions": {"width": None, "height": None},
+            "processing_parameters": {
+                "resize_dimensions": None,
+                "crop_dimensions": None,
             },
-            'processing_parameters': {
-                'resize_dimensions': None,  # Add actual resize dimensions if applicable
-                'crop_dimensions': None  # Add actual crop dimensions if applicable
-            },
-            'roi_details': [],
-            'fly_trail_history': {}  # New field to store fly trail history
+            "roi_details": [],
+            "fly_trail_history": {},
         }
 
-        # Attempt to capture video dimensions
         cap = cv2.VideoCapture(self.video_path)
         if cap.isOpened():
-            width = cap.get(cv2.CAP_PROP_FRAME_WIDTH)
-            height = cap.get(cv2.CAP_PROP_FRAME_HEIGHT)
-            video_info['video_dimensions']['width'] = width
-            video_info['video_dimensions']['height'] = height
+            video_info["video_dimensions"]["width"] = cap.get(cv2.CAP_PROP_FRAME_WIDTH)
+            video_info["video_dimensions"]["height"] = cap.get(cv2.CAP_PROP_FRAME_HEIGHT)
         cap.release()
 
-        # Export the detailed information of each ROI, including the calculated radius
         for roi_id, details in self.roi_details.items():
-            roi_info = {
-                'id': roi_id,
-                'center': details['center'],
-                'radius': details['radius'],
-                'void': self.void_rois.get(roi_id, False),
-                'has_mating_start_time': roi_id in self.mating_start_times
-            }
-            video_info['roi_details'].append(roi_info)
+            video_info["roi_details"].append({
+                "id": roi_id,
+                "center": details["center"],
+                "radius": details["radius"],
+                "void": self.void_rois.get(roi_id, False),
+                "has_mating_start_time": roi_id in self.mating_start_times,
+            })
 
-        # Include fly trail history for each ROI
         for roi_id, trail in self.fly_trail_history.items():
-            # Convert each point in the trail from a tuple to a list for JSON serialization
-            video_info['fly_trail_history'][roi_id] = [list(point) for point in trail]
+            video_info["fly_trail_history"][roi_id] = [list(pt) for pt in trail]
 
-        export_path = os.path.splitext(self.video_path)[0] + '_roi_details_with_behavior.json'
-        with open(export_path, 'w') as file:
-            json.dump(video_info, file, indent=4)
+        export_path = os.path.splitext(self.video_path)[0] + "_roi_details_with_behavior.json"
+        with open(export_path, "w") as f:
+            json.dump(video_info, f, indent=4)
+        print(f"ROI details exported to {export_path}")
 
-        print(f"ROI details with mating behavior exported to {export_path}")
+    def export_combined_mating_times(self):
+        """Return a DataFrame of mating start times, merging events within 1 second."""
+        combined_mating_times = {}
+        for roi_id, mating_time in self.mating_start_times.items():
+            merged = False
+            for cid, ctime in combined_mating_times.items():
+                if abs(mating_time - ctime) <= 1:
+                    # Keep the earlier start time rather than averaging
+                    combined_mating_times[cid] = min(ctime, mating_time)
+                    merged = True
+                    break
+            if not merged:
+                combined_mating_times[roi_id] = mating_time
+
+        rows = []
+        for roi_id, start_time in combined_mating_times.items():
+            rows.append({
+                "ROI": roi_id,
+                "Start Time": start_time,
+                "Mating Duration": self.mating_durations.get(roi_id, 0),
+            })
+        return pd.DataFrame(rows)
 
 
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-
-        # Set up the main window attributes
         self.setWindowTitle("Fly Behavior Analysis")
-        self.setGeometry(200, 200, 1700, 1400)  # Adjust size as needed
+        self.setGeometry(200, 200, 1700, 1400)
 
-        # Paths and initial setups
         self.video_path = None
         self.initial_contours = []
-        self.video_paths = []  # List to store multiple video paths
-        self.video_threads = {}  # Dictionary to store threads for each video path
-        self.current_video_index = 0  # Index to keep track of the currently displayed video
-        self.latest_frames = {}  # Stores the latest frame for each video
-        self.latest_mating_durations = {}  # Stores the latest mating durations for each video
-        self.mating_start_times_dfs = {}  # Dictionary to store mating start times for each video
+        self.video_paths = []
+        self.video_threads = {}
+        self.current_video_index = 0
+        self.latest_frames = {}
+        self.latest_mating_durations = {}
+        self.mating_start_times_dfs = {}
         self.center_gender_duration_labels = {}
         self.video_queue = []
+        # Fix 24: store per-video FPS instead of overwriting a shared field
+        self.video_fps = {}
 
-
-        # Organize UI elements
         self.init_ui()
-        self.auto_export_directory = "path_to_export_directory"  # Set a default directory for auto-export
-
 
     def init_ui(self):
-        # Video Display & Info Section
+        # --- Video Display ---
         video_display_group = QGroupBox("Video Display", self)
         video_display_group.setGeometry(10, 10, 870, 500)
-
         vbox = QVBoxLayout()
-
         self.video_label = QLabel()
         self.video_label.setFixedSize(860, 440)
         vbox.addWidget(self.video_label)
-
         hbox = QHBoxLayout()
-        self.frame_label = QLabel('Frame: 0')
+        self.frame_label = QLabel("Frame: 0")
         hbox.addWidget(self.frame_label)
-        self.time_label = QLabel('Time (s): 0')
+        self.time_label = QLabel("Time (s): 0")
         hbox.addWidget(self.time_label)
         vbox.addLayout(hbox)
-
         video_display_group.setLayout(vbox)
 
-        # Video Control Section
+        # --- Video Controls ---
         video_control_group = QGroupBox("Video Controls", self)
-        video_control_group.setGeometry(10, 520, 870, 110)
-
+        video_control_group.setGeometry(10, 520, 870, 140)
         vbox = QVBoxLayout()
 
         self.fps_input = QLineEdit()
-        self.fps_input.setPlaceholderText("Enter Video FPS")
+        self.fps_input.setPlaceholderText("Enter Video FPS (auto-filled on video select)")
         vbox.addWidget(self.fps_input)
+
+        # Fix 18: skip_frames_input placed inside the controls group with a label
+        skip_hbox = QHBoxLayout()
+        skip_hbox.addWidget(QLabel("Skip (s):"))
+        self.skip_frames_input = QLineEdit()
+        self.skip_frames_input.setPlaceholderText("Seconds to skip at start")
+        skip_hbox.addWidget(self.skip_frames_input)
+        skip_hbox.addWidget(QLabel("Frame skip:"))
+        self.frame_skip_input = QLineEdit()
+        self.frame_skip_input.setPlaceholderText("Process every Nth frame")
+        skip_hbox.addWidget(self.frame_skip_input)
+        vbox.addLayout(skip_hbox)
 
         hbox = QHBoxLayout()
         self.select_button = QPushButton("Select Video")
         self.select_button.clicked.connect(self.select_video)
         hbox.addWidget(self.select_button)
-
         self.start_button = QPushButton("Start Processing")
         self.start_button.clicked.connect(self.start_processing)
         hbox.addWidget(self.start_button)
-
         self.stop_button = QPushButton("Stop Processing")
         self.stop_button.clicked.connect(self.stop_processing)
         hbox.addWidget(self.stop_button)
-
         vbox.addLayout(hbox)
         video_control_group.setLayout(vbox)
 
-        # Video List Section
+        # --- Video List ---
         video_list_group = QGroupBox("Video List", self)
-        video_list_group.setGeometry(10, 640, 870, 120)
-
+        video_list_group.setGeometry(10, 670, 870, 120)
         vbox = QVBoxLayout()
-
         self.video_list_widget = QListWidget()
         vbox.addWidget(self.video_list_widget)
-
         video_list_group.setLayout(vbox)
 
-        # Mating Information Display Area
+        # --- Mating Info ---
         mating_info_area = QWidget(self)
-        mating_info_area.setGeometry(10, 750, 870, 150)
-
+        mating_info_area.setGeometry(10, 800, 870, 150)
         hbox = QHBoxLayout()
 
-        # Mating Duration Display with Scrollable Area
         mating_duration_group = QGroupBox("Mating Durations", mating_info_area)
         vbox = QVBoxLayout()
         self.mating_duration_label = QLabel("Mating Durations:")
         vbox.addWidget(self.mating_duration_label)
-
-        # Create a scroll area for mating durations
         mating_duration_scroll = QScrollArea()
         mating_duration_scroll.setWidgetResizable(True)
         mating_duration_scroll.setWidget(mating_duration_group)
         mating_duration_group.setLayout(vbox)
         hbox.addWidget(mating_duration_scroll)
 
-        # Verified Mating Times Display with Scrollable Area
         verified_times_group = QGroupBox("Verified Mating Times", mating_info_area)
         vbox = QVBoxLayout()
         self.verified_mating_times_label = QLabel("Verified Mating Times:")
         vbox.addWidget(self.verified_mating_times_label)
-
-        # Create a scroll area for verified mating times
         verified_times_scroll = QScrollArea()
         verified_times_scroll.setWidgetResizable(True)
         verified_times_scroll.setWidget(verified_times_group)
@@ -696,415 +717,396 @@ class MainWindow(QMainWindow):
 
         mating_info_area.setLayout(hbox)
 
-        # Navigation Controls
+        # --- Navigation ---
         nav_group = QGroupBox("Navigation", self)
-        nav_group.setGeometry(10, 900, 870, 80)
-
+        nav_group.setGeometry(10, 960, 870, 80)
         hbox = QHBoxLayout()
-
-        # Use arrow icons for previous and next buttons
         self.prev_button = QPushButton("← Previous Video")
         self.prev_button.clicked.connect(self.previous_video)
         hbox.addWidget(self.prev_button)
-
         self.next_button = QPushButton("Next Video →")
         self.next_button.clicked.connect(self.next_video)
         hbox.addWidget(self.next_button)
-
         nav_group.setLayout(hbox)
 
-        # Export Functionality
+        # --- Data Export ---
         export_group = QGroupBox("Data Export", self)
-        export_group.setGeometry(10, 965, 870, 80)
-
-        self.skip_frames_input = QLineEdit(self)
-        self.skip_frames_input.setPlaceholderText("Enter number of seconds to skip")
-        self.skip_frames_input.setGeometry(1000, 20, 200, 30)  # x, y, width, height
-
+        export_group.setGeometry(10, 1050, 870, 80)
         hbox = QHBoxLayout()
-
         self.export_button = QPushButton("Export DataFrame")
         self.export_button.clicked.connect(self.export_dataframe)
         self.export_button.setToolTip("Export the mating data as a CSV file.")
         hbox.addWidget(self.export_button)
-
+        self.export_roi_button = QPushButton("Export ROI Locations")
+        self.export_roi_button.clicked.connect(self.export_roi_locations)
+        hbox.addWidget(self.export_roi_button)
         self.processing_status_label = QLabel("Status: Awaiting action.")
         hbox.addWidget(self.processing_status_label)
-
         export_group.setLayout(hbox)
 
-
+        # --- Manual ROI Control ---
+        # Fix 14: only one roi_control_group (removed first duplicate)
         self.roi_control_group = QGroupBox("Manual ROI Control", self)
-        self.roi_control_group.setGeometry(890, 35, 300, 80)  # Adjust the position and size as needed
-
-        roi_control_layout = QHBoxLayout()
-
-        # Modify or replace the existing ROI control group
-        self.roi_control_group = QGroupBox("Manual ROI Control", self)
-        self.roi_control_group.setGeometry(890, 35, 300, 200)  # Adjust the position and size as needed
-
-        roi_control_layout = QVBoxLayout()  # Changed to QVBoxLayout for better alignment
-
-        # Add a QLineEdit for multiple ROI IDs
+        self.roi_control_group.setGeometry(890, 35, 300, 200)
+        roi_control_layout = QVBoxLayout()
         self.multi_roi_input = QLineEdit(self)
-        self.multi_roi_input.setPlaceholderText("Enter multiple ROI IDs separated by commas")
+        self.multi_roi_input.setPlaceholderText("ROI IDs to void (e.g. 0,2,4-7)")
         roi_control_layout.addWidget(self.multi_roi_input)
-
-        # Add a button for voiding multiple ROIs
         self.void_multi_roi_button = QPushButton("Void Multiple ROIs", self)
         self.void_multi_roi_button.clicked.connect(self.void_multiple_rois)
         roi_control_layout.addWidget(self.void_multi_roi_button)
-
-        # Add a QListWidget to display ROI voiding status
         self.roi_void_list = QListWidget(self)
         roi_control_layout.addWidget(self.roi_void_list)
-
         self.roi_control_group.setLayout(roi_control_layout)
 
-        # Add an input for frame skip value
-        self.frame_skip_input = QLineEdit(self)
-        self.frame_skip_input.setPlaceholderText("Enter Frame Skip Value")
-
-        # Set the geometry of the frame skip input (x, y, width, height)
-        self.frame_skip_input.setGeometry(890, 230, 160, 30)  # Adjust these values as needed
-
-        # Initialize the list to store center mating duration labels
-        self.center_mating_duration_labels = []
-
-        # Center Mating Duration Display Area
+        # --- Center Mating Duration ---
+        self.center_mating_duration_labels = {}  # Fix 19: dict keyed by roi_id
         self.center_mating_duration_group = QGroupBox("Center Mating Duration", self)
-        self.center_mating_duration_group.setGeometry(890, 280, 300, 300)
-
+        self.center_mating_duration_group.setGeometry(890, 250, 300, 300)
         self.center_mating_duration_layout = QVBoxLayout()
         self.center_mating_duration_group.setLayout(self.center_mating_duration_layout)
-
         self.scroll_widget_for_center_mating_duration = QWidget()
-        self.scroll_layout_for_center_mating_duration = QVBoxLayout(self.scroll_widget_for_center_mating_duration)
-
+        self.scroll_layout_for_center_mating_duration = QVBoxLayout(
+            self.scroll_widget_for_center_mating_duration
+        )
         self.scroll_area_for_center_mating_duration = QScrollArea()
         self.scroll_area_for_center_mating_duration.setWidgetResizable(True)
-        self.scroll_area_for_center_mating_duration.setWidget(self.scroll_widget_for_center_mating_duration)
+        self.scroll_area_for_center_mating_duration.setWidget(
+            self.scroll_widget_for_center_mating_duration
+        )
+        self.center_mating_duration_layout.addWidget(
+            self.scroll_area_for_center_mating_duration
+        )
 
-        self.center_mating_duration_layout.addWidget(self.scroll_area_for_center_mating_duration)
-
-        # Center Gender Duration Display Area
+        # --- Center Gender Duration ---
         self.center_gender_duration_group = QGroupBox("Center Gender Duration", self)
-        self.center_gender_duration_group.setGeometry(890, 580, 300, 300)
-
+        self.center_gender_duration_group.setGeometry(890, 560, 300, 300)
         self.center_gender_duration_layout = QVBoxLayout()
         self.center_gender_duration_group.setLayout(self.center_gender_duration_layout)
-
         self.scroll_widget_for_center_gender_duration = QWidget()
-        self.scroll_layout_for_center_gating_duration = QVBoxLayout(self.scroll_widget_for_center_gender_duration)
-
+        # Fix 31: corrected typo "gating" → "gender"
+        self.scroll_layout_for_center_gender_duration = QVBoxLayout(
+            self.scroll_widget_for_center_gender_duration
+        )
         self.scroll_area_for_center_gender_duration = QScrollArea()
         self.scroll_area_for_center_gender_duration.setWidgetResizable(True)
-        self.scroll_area_for_center_gender_duration.setWidget(self.scroll_widget_for_center_gender_duration)
+        self.scroll_area_for_center_gender_duration.setWidget(
+            self.scroll_widget_for_center_gender_duration
+        )
+        self.center_gender_duration_layout.addWidget(
+            self.scroll_area_for_center_gender_duration
+        )
 
-        self.center_gender_duration_layout.addWidget(self.scroll_area_for_center_gender_duration)
-
+        # --- Video Queue ---
         video_queue_group = QGroupBox("Video Queue", self)
-        video_queue_group.setGeometry(1200, 40, 300, 400)  # Adjust the position and size as needed
-
+        video_queue_group.setGeometry(1200, 40, 300, 400)
         queue_layout = QVBoxLayout()
-
-        # Button to add videos to the queue
         self.add_to_queue_button = QPushButton("Add Videos to Queue")
         self.add_to_queue_button.clicked.connect(self.add_videos_to_queue)
         queue_layout.addWidget(self.add_to_queue_button)
-
-        # Button to clear the queue
         self.clear_queue_button = QPushButton("Clear Queue")
         self.clear_queue_button.clicked.connect(self.clear_video_queue)
         queue_layout.addWidget(self.clear_queue_button)
-
-        # List widget to display queued videos
         self.video_queue_list_widget = QListWidget()
         queue_layout.addWidget(self.video_queue_list_widget)
-
         video_queue_group.setLayout(queue_layout)
 
         self.start_queue_button = QPushButton("Start Processing Queue", self)
         self.start_queue_button.clicked.connect(self.start_processing_queue)
-        self.start_queue_button.setGeometry(1200, 440, 300, 30)  # Adjust geometry as needed
+        self.start_queue_button.setGeometry(1200, 440, 300, 30)
 
-        video_queue_layout = QVBoxLayout()
-
-        self.export_roi_button = QPushButton("Export ROI Locations")
-        self.export_roi_button.clicked.connect(self.export_roi_locations)
-        export_group.layout().addWidget(self.export_roi_button)  # Add button to the export group layout
-
+    # ----------------------------------------------------------------
+    # ROI Export
+    # ----------------------------------------------------------------
     def export_roi_locations(self):
+        # Fix 26: guard against empty video list
+        if not self.video_paths:
+            self.show_error("No video loaded.")
+            return
         current_video_path = self.video_paths[self.current_video_index]
         video_thread = self.video_threads.get(current_video_path)
         if video_thread:
             video_thread.export_roi_locations()
         else:
-            print("Error: No active video thread found for the current video.")
+            self.show_error("No active video thread found for the current video.")
 
+    # ----------------------------------------------------------------
+    # Queue management
+    # ----------------------------------------------------------------
     def add_videos_to_queue(self):
-        directory = QFileDialog.getExistingDirectory(self, "Select Directory with AVI Files")
+        directory = QFileDialog.getExistingDirectory(self, "Select Directory with Video Files")
         if directory:
-            # Walk through the directory and its subdirectories
             for root, dirs, files in os.walk(directory):
                 for filename in files:
-                    # Check if the file is an .avi file and does not start with ._
                     if filename.endswith(".mp4") and not filename.startswith("._"):
                         video_path = os.path.join(root, filename)
                         if video_path not in self.video_queue:
-                            self.set_fps_from_video(video_path)
+                            # Fix 24: store FPS per video, don't overwrite shared field
+                            self._store_fps_from_video(video_path)
                             self.video_queue.append(video_path)
-                            # Display the relative path from the selected directory
                             relative_path = os.path.relpath(video_path, directory)
                             self.video_queue_list_widget.addItem(relative_path)
 
     def clear_video_queue(self):
-        # Clear the video queue and update the list widget
         self.video_queue.clear()
         self.video_queue_list_widget.clear()
-        self.processing_status_label.setText('Video queue cleared.')
-        # Optionally, you might want to disable the start processing queue button if the queue is empty
+        self.processing_status_label.setText("Video queue cleared.")
         self.start_queue_button.setEnabled(False)
 
     def start_processing_queue(self):
         if not self.video_queue:
             self.show_error("The video queue is empty.")
             return
-
-        if self.fps_input.text():
-            self.start_button.setEnabled(False)
-            self.select_button.setEnabled(False)
-            self.stop_button.setEnabled(True)
-            self.processing_status_label.setText('Starting to process the video queue...')
-            first_video_path = self.video_queue.pop(0)
-            self.start_processing_video(first_video_path)
-        else:
-            self.show_error("FPS value is required to process the queue.")
+        # Fix 32: validate FPS input
+        fps = self._parse_fps()
+        if fps is None:
+            return
+        self.start_button.setEnabled(False)
+        self.select_button.setEnabled(False)
+        self.stop_button.setEnabled(True)
+        self.processing_status_label.setText("Starting to process the video queue...")
+        first_video_path = self.video_queue.pop(0)
+        self.start_processing_video(first_video_path)
 
     def start_processing_video(self, video_path):
-        # Get the frames per second (FPS) value from the input field
-        fps = float(self.fps_input.text())
+        # Fix 24: use per-video stored FPS, fall back to UI input
+        fps = self.video_fps.get(video_path) or self._parse_fps()
+        if fps is None:
+            self.show_error("Could not determine FPS for this video.")
+            return
 
-        # Get the number of seconds to skip from the input field and convert it to frames
         skip_seconds = float(self.skip_frames_input.text()) if self.skip_frames_input.text() else 0
         skip_frames = int(skip_seconds * fps)
 
-        # Get the number of frames to skip for performance (if provided)
         try:
             perf_frame_skips = int(self.frame_skip_input.text())
+            if perf_frame_skips < 1:
+                perf_frame_skips = 1
         except ValueError:
-            perf_frame_skips = 1  # Default value if input is invalid
+            perf_frame_skips = 1
 
-        # Initialize the video processing thread with the provided video path and settings
         video_thread = VideoProcessingThread(video_path, [], fps, skip_frames, perf_frame_skips)
-
-        # Store the thread in a dictionary to keep track of it
         self.video_threads[video_path] = video_thread
 
-        # Connect the finished signal to the method that handles queue processing
+        # Fix 33: clean up finished threads
+        video_thread.finished.connect(lambda: self._on_thread_finished(video_thread))
         video_thread.finished.connect(self.process_next_video_in_queue)
-
-        # Connect other necessary signals
         video_thread.frame_processed.connect(self.update_video_frame)
         video_thread.frame_info.connect(self.update_frame_info)
-        video_thread.mating_analysis_complete.connect(self.export_dataframe)
+        # Fix 17: wrap export_dataframe in lambda to discard the video_path str argument
+        video_thread.mating_analysis_complete.connect(lambda _: self.export_dataframe())
         video_thread.center_mating_duration_signal.connect(self.update_center_mating_duration)
         video_thread.verified_mating_start_times.connect(self.update_verified_mating_times)
         video_thread.center_gender_duration_signal.connect(self.update_center_gender_duration)
         video_thread.void_roi_signal.connect(self.void_roi_handler)
 
-        # Start the video processing thread
         video_thread.start()
+
+    def _on_thread_finished(self, thread):
+        # Fix 33: schedule deletion of finished thread objects
+        thread.deleteLater()
 
     def process_next_video_in_queue(self):
         if self.video_queue:
             next_video_path = self.video_queue.pop(0)
             self.start_processing_video(next_video_path)
         else:
-            self.processing_status_label.setText('Video queue processing completed.')
+            self.processing_status_label.setText("Video queue processing completed.")
             self.start_button.setEnabled(True)
             self.select_button.setEnabled(True)
             self.stop_button.setEnabled(False)
 
+    # ----------------------------------------------------------------
+    # Helpers
+    # ----------------------------------------------------------------
     def show_error(self, message):
         QMessageBox.critical(self, "Error", message)
 
     def show_info(self, title, message):
         QMessageBox.information(self, title, message)
 
-    def void_roi(self):
+    def _store_fps_from_video(self, video_path):
+        """Read and cache the FPS of a video file."""
+        cap = cv2.VideoCapture(video_path)
+        fps = cap.get(cv2.CAP_PROP_FPS)
+        cap.release()
+        if fps > 0:
+            self.video_fps[video_path] = fps
+        return fps
+
+    def _parse_fps(self):
+        """Parse the FPS input field; show error and return None if invalid."""
+        # Fix 32: wrap conversion in try/except
         try:
-            roi_id = int(self.roi_id_input.text())
-            current_video_path = self.video_paths[self.current_video_index]
-            video_thread = self.video_threads.get(current_video_path)
-            if video_thread:
-                video_thread.void_roi(roi_id)
-                print(f"Manually voided ROI {roi_id} in video {current_video_path}")
-            else:
-                self.show_error("No video thread found for the current video.")
+            fps = float(self.fps_input.text())
+            if fps <= 0:
+                raise ValueError
+            return fps
         except ValueError:
-            self.show_error("Invalid ROI ID entered.")
+            self.show_error("Please enter a valid FPS value (positive number).")
+            return None
+
+    # ----------------------------------------------------------------
+    # Void ROI
+    # ----------------------------------------------------------------
+    # Fix 15: removed dead void_roi() method that referenced non-existent roi_id_input
 
     def void_multiple_rois(self):
-        roi_input = self.multi_roi_input.text().strip()  # Get input text and remove leading/trailing whitespace
+        # Fix 25: guard against empty video list
+        if not self.video_paths:
+            self.show_error("No video loaded.")
+            return
+
+        roi_input = self.multi_roi_input.text().strip()
         roi_ids = []
-
-        # Split the input by commas to get individual entries
-        roi_entries = roi_input.split(',')
-
-        for entry in roi_entries:
-            entry = entry.strip()  # Remove leading/trailing whitespace from each entry
-
-            # Check if the entry contains a dash to indicate a range
-            if '-' in entry:
-                start, end = map(int, entry.split('-'))
-                roi_ids.extend(range(start, end + 1))
+        for entry in roi_input.split(","):
+            entry = entry.strip()
+            if "-" in entry:
+                try:
+                    start, end = map(int, entry.split("-"))
+                    roi_ids.extend(range(start, end + 1))
+                except ValueError:
+                    self.show_error(f"Invalid ROI range: {entry}")
+                    return
             else:
                 try:
-                    roi_id = int(entry)
-                    roi_ids.append(roi_id)
+                    roi_ids.append(int(entry))
                 except ValueError:
-                    self.show_error(f"Invalid ROI ID or range: {entry}")
+                    self.show_error(f"Invalid ROI ID: {entry}")
+                    return
 
         current_video_path = self.video_paths[self.current_video_index]
         video_thread = self.video_threads.get(current_video_path)
-
         if video_thread:
             for roi_id in roi_ids:
                 video_thread.void_roi(roi_id)
-                self.roi_void_list.addItem(f"ROI {roi_id} voided in video {current_video_path}")
-                print(f"Manually voided ROI {roi_id} in video {current_video_path}")
+                self.roi_void_list.addItem(f"ROI {roi_id} voided in {current_video_path}")
         else:
             self.show_error("No video thread found for the current video.")
 
-    def add_export_button(self):
-        self.export_button = QPushButton("Export DataFrame", self)
-        self.export_button.setGeometry(10, 480, 780, 30)
-        self.export_button.clicked.connect(self.export_dataframe)
-        self.export_button.setEnabled(False)  # The button is initially disabled
+    # Fix 16: removed dead add_export_button() and enable_export_button() methods
 
-    def enable_export_button(self):
-        self.export_button.setEnabled(True)
-
-    # Method to dynamically add labels for new ROIs
-    def add_center_mating_duration_label(self, roi_id):
-        label = QLabel(f"ROI {roi_id}: Center Mating Duration: Not Available")
-        label.setWordWrap(True)
-        self.scroll_layout_for_center_mating_duration.addWidget(label)
-        self.center_mating_duration_labels.append(label)
+    # ----------------------------------------------------------------
+    # Center duration labels
+    # ----------------------------------------------------------------
+    def _get_or_create_center_mating_label(self, roi_id):
+        # Fix 19: use dict instead of list to avoid IndexError gaps
+        if roi_id not in self.center_mating_duration_labels:
+            label = QLabel(f"ROI {roi_id}: Center Mating Duration: N/A")
+            label.setWordWrap(True)
+            self.scroll_layout_for_center_mating_duration.addWidget(label)
+            self.center_mating_duration_labels[roi_id] = label
+        return self.center_mating_duration_labels[roi_id]
 
     def update_center_mating_duration(self, roi_id, duration):
-        while len(self.center_mating_duration_labels) <= roi_id:
-            self.add_center_mating_duration_label(len(self.center_mating_duration_labels))
-
-        self.center_mating_duration_labels[roi_id].setText(
-            f"ROI {roi_id}: Center Mating Duration: {duration:.2f} seconds")
+        label = self._get_or_create_center_mating_label(roi_id)
+        label.setText(f"ROI {roi_id}: Center Mating Duration: {duration:.2f} s")
 
     def add_center_gender_duration_label(self, roi_id, gender):
         key = (roi_id, gender)
         if key not in self.center_gender_duration_labels:
-            label = QLabel(f"ROI {roi_id} ({gender}): Center Gender Duration: Not Available")
+            label = QLabel(f"ROI {roi_id} ({gender}): Center Duration: N/A")
             label.setWordWrap(True)
-            self.scroll_layout_for_center_gating_duration.addWidget(label)
+            # Fix 31: use corrected attribute name
+            self.scroll_layout_for_center_gender_duration.addWidget(label)
             self.center_gender_duration_labels[key] = label
 
     def update_center_gender_duration(self, roi_id, male_duration, female_duration):
-        self.add_center_gender_duration_label(roi_id, 'male')
-        self.add_center_gender_duration_label(roi_id, 'female')
-
-        male_key = (roi_id, 'male')
-        female_key = (roi_id, 'female')
-
+        self.add_center_gender_duration_label(roi_id, "male")
+        self.add_center_gender_duration_label(roi_id, "female")
+        male_key = (roi_id, "male")
+        female_key = (roi_id, "female")
         if male_key in self.center_gender_duration_labels:
             self.center_gender_duration_labels[male_key].setText(
-                f"ROI {roi_id} (male): Center Gender Duration: {male_duration:.2f} seconds")
-
+                f"ROI {roi_id} (male): Center Duration: {male_duration:.2f} s"
+            )
         if female_key in self.center_gender_duration_labels:
             self.center_gender_duration_labels[female_key].setText(
-                f"ROI {roi_id} (female): Center Gender Duration: {female_duration:.2f} seconds")
+                f"ROI {roi_id} (female): Center Duration: {female_duration:.2f} s"
+            )
 
+    # ----------------------------------------------------------------
+    # Export
+    # ----------------------------------------------------------------
     def export_dataframe(self):
-        video_threads_items = list(self.video_threads.items())
-        for video_path, video_thread in video_threads_items:
-            if video_thread:
-                # Generate the default export name based on the video file name
-                default_export_name = os.path.splitext(video_path)[0] + '_analysis.csv'
+        for video_path, video_thread in list(self.video_threads.items()):
+            if not video_thread:
+                continue
 
-                # Prepare data for export
-                data = []
-                num_rois = len(video_thread.initial_contours)
-                for roi in range(num_rois):
-                    start_time = video_thread.mating_start_times.get(roi, 'N/A')
-                    start_time = 'N/A' if start_time == 'N/A' else max(0, start_time - 360)
+            default_export_name = os.path.splitext(video_path)[0] + "_analysis.csv"
+            data = []
+            num_rois = len(video_thread.initial_contours)
 
-                    durations = video_thread.mating_durations.get(roi, [])
-                    longest_duration = max(durations, default=0)
-                    # Find the longest durations
-                    longest_duration = 0 if longest_duration < 360 else longest_duration
+            for roi in range(num_rois):
+                # Fix 12: start_time is now the real start time (no -360 adjustment needed)
+                start_time = video_thread.mating_start_times.get(roi, "N/A")
 
-                    # Mating status is true if the most recent mating event lasted at least 360 seconds
-                    mating_status = durations[-1] >= 360 if durations else False
+                # Fix 11: mating_durations[roi] is now a single float, not a list
+                current_duration = video_thread.mating_durations.get(roi, 0)
+                longest_duration = current_duration if current_duration >= 360 else 0
 
-                    center_mating_durations = video_thread.center_mating_duration.get(roi, [])
-                    total_center_mating_duration = sum(center_mating_durations)
-                    if total_center_mating_duration > 15:
-                        total_center_mating_duration -= 15
+                # Fix 21: use the actual duration value for mating_status
+                mating_status = current_duration >= 360
 
-                    # Calculate outside center mating duration
-                    outside_center_mating_duration = max(0, longest_duration - total_center_mating_duration)
+                # Fix 29: center_mating_duration is now a running total float
+                total_center_mating_duration = video_thread.center_mating_duration.get(roi, 0.0)
+                # Fix 22: removed unexplained magic -15 subtraction
 
-                    center_male_duration = video_thread.center_gender_duration.get(roi, {}).get('male', 0)
-                    center_female_duration = video_thread.center_gender_duration.get(roi, {}).get('female', 0)
+                outside_center_mating_duration = max(
+                    0.0, longest_duration - total_center_mating_duration
+                )
 
-                    pre_mating_male_duration = video_thread.pre_mating_center_gender_duration.get(roi, {}).get('male',
-                                                                                                               0)
-                    pre_mating_female_duration = video_thread.pre_mating_center_gender_duration.get(roi, {}).get(
-                        'female', 0)
+                center_male_duration = video_thread.center_gender_duration.get(roi, {}).get("male", 0)
+                center_female_duration = video_thread.center_gender_duration.get(roi, {}).get("female", 0)
+                pre_mating_male = video_thread.pre_mating_center_gender_duration.get(roi, {}).get("male", 0)
+                pre_mating_female = video_thread.pre_mating_center_gender_duration.get(roi, {}).get("female", 0)
+                post_mating_male = center_male_duration - pre_mating_male
+                post_mating_female = center_female_duration - pre_mating_female
+                non_mating_center = (center_male_duration + center_female_duration) / 2
 
-                    post_mating_male_duration = center_male_duration - pre_mating_male_duration
-                    post_mating_female_duration = center_female_duration - pre_mating_female_duration
+                data.append({
+                    "ROI": roi,
+                    "Mating Start Time (s)": start_time,
+                    "Longest Duration (s)": longest_duration,
+                    "Mating Status": mating_status,
+                    "Center-Mating Duration (s)": total_center_mating_duration,
+                    "Male Time in Center (s)": center_male_duration,
+                    "Female Time in Center (s)": center_female_duration,
+                    "Average Non-Mating Center (s)": non_mating_center,
+                    "Outside Center Mating Duration (s)": outside_center_mating_duration,
+                    "Pre-mating Male Center (s)": pre_mating_male,
+                    "Post-mating Male Center (s)": post_mating_male,
+                    "Pre-mating Female Center (s)": pre_mating_female,
+                    "Post-mating Female Center (s)": post_mating_female,
+                })
 
-                    non_mating_center_duration = (center_male_duration + center_female_duration) / 2
+            df = pd.DataFrame(data)
 
-                    # Get the center gender durations
-                    center_male_duration = video_thread.center_gender_duration.get(roi, {}).get('male', 0)
-                    center_female_duration = video_thread.center_gender_duration.get(roi, {}).get('female', 0)
+            # Mark void ROIs
+            void_rois = video_thread.void_rois
+            for col in ["Mating Start Time (s)", "Longest Duration (s)", "Mating Status"]:
+                df[col] = df.apply(
+                    lambda row: "N/A" if void_rois.get(row["ROI"], False) else row[col],
+                    axis=1,
+                )
 
-                    data.append({'ROI': roi,
-                                 'Adjusted Start Time': start_time,
-                                 'Longest Duration': longest_duration,
-                                 'Mating Status': mating_status,
-                                 'Center-Mating Duration': total_center_mating_duration,
-                                 'Male Time in Center': center_male_duration,
-                                 'Female Time in Center': center_female_duration,
-                                 'Average Non Mating':non_mating_center_duration,
-                                 'Outside Center Mating Duration':outside_center_mating_duration,
-                                 'Pre-mating Male Center Duration': pre_mating_male_duration,
-                                 'Post-mating Male Center Duration': post_mating_male_duration,
-                                 'Pre-mating Female Center Duration': pre_mating_female_duration,
-                                 'Post-mating Female Center Duration': post_mating_female_duration})
+            df.to_csv(default_export_name, index=False)
+            self.processing_status_label.setText(
+                f"DataFrame for {video_path} exported successfully."
+            )
+            print(f"Exported: {default_export_name}")
 
-                # Create DataFrame
-                mating_times_df = pd.DataFrame(data)
-
-                # Mark void ROIs as 'N/A'
-                void_rois = video_thread.void_rois
-                for column in ['Adjusted Start Time', 'Longest Duration', 'Mating Status']:
-                    mating_times_df[column] = mating_times_df.apply(
-                        lambda row: 'N/A' if void_rois.get(row['ROI'], False) else row[column], axis=1)
-
-                # Export to CSV
-                mating_times_df.to_csv(default_export_name, index=False)
-                self.processing_status_label.setText(f'DataFrame for {video_path} exported successfully.')
-                print(f"Success: DataFrame for {video_path} exported successfully.")
-
+    # ----------------------------------------------------------------
+    # Navigation
+    # ----------------------------------------------------------------
     def previous_video(self):
         if self.current_video_index > 0:
             self.current_video_index -= 1
             current_video_path = self.video_paths[self.current_video_index]
             if current_video_path in self.latest_frames:
                 frame = self.latest_frames[current_video_path]
-                mating_durations = self.latest_mating_durations[current_video_path]
+                # Fix 27: use .get() to avoid KeyError
+                mating_durations = self.latest_mating_durations.get(current_video_path, {})
                 self.update_video_frame(current_video_path, frame, mating_durations)
 
     def next_video(self):
@@ -1113,156 +1115,163 @@ class MainWindow(QMainWindow):
             current_video_path = self.video_paths[self.current_video_index]
             if current_video_path in self.latest_frames:
                 frame = self.latest_frames[current_video_path]
-                mating_durations = self.latest_mating_durations[current_video_path]
+                # Fix 27: use .get() to avoid KeyError
+                mating_durations = self.latest_mating_durations.get(current_video_path, {})
                 self.update_video_frame(current_video_path, frame, mating_durations)
 
+    # ----------------------------------------------------------------
+    # Mating times display
+    # ----------------------------------------------------------------
     def update_verified_mating_times(self, video_path, mating_times_dict):
-        # Check if there are videos in the list
         if not self.video_paths:
-            print("There are no videos in the list.")
+            return
+        if not (0 <= self.current_video_index < len(self.video_paths)):
+            return
+        if video_path != self.video_paths[self.current_video_index]:
             return
 
-        # Ensure the current video index is within the bounds
-        if not 0 <= self.current_video_index < len(self.video_paths):
-            print("Current video index is out of range.")
-            return
+        adjusted = {roi_id: t for roi_id, t in mating_times_dict.items()}
+        rows = []
+        for roi_id, start_time in adjusted.items():
+            # Fix 20: mating_durations[roi] is now a float, not a list
+            duration = self.video_threads[video_path].mating_durations.get(roi_id, 0)
+            rows.append({"ROI": roi_id, "Start Time": start_time, "Mating Duration": duration})
 
-        # Get the path of the current video
-        current_video_path = self.video_paths[self.current_video_index]
+        mating_times_df = pd.DataFrame(rows)
+        self.mating_start_times_dfs[video_path] = mating_times_df
 
-        # Check if the video path corresponds to the current video
-        if video_path != current_video_path:
-            print("The video path does not match the current video.")
-            return
+        mating_time_text = "\n".join(
+            f"ROI {row['ROI']}: {row['Start Time']:.2f} s"
+            for _, row in mating_times_df.iterrows()
+        )
+        self.verified_mating_times_label.setText(mating_time_text)
 
-        # Process the mating times for the current video
-        adjusted_mating_times_dict = {roi_id: max(0, time - 360) for roi_id, time in mating_times_dict.items()}
-        mating_times_df = pd.DataFrame(list(adjusted_mating_times_dict.items()), columns=['ROI', 'Start Time'])
-
-        # Calculate mating durations and adjust the mating times
-        if video_path in self.video_threads and hasattr(self.video_threads[video_path], 'mating_durations'):
-            durations = self.video_threads[video_path].mating_durations
-            mating_times_df['Mating Duration'] = [durations.get(roi_id, 0) for roi_id in mating_times_df['ROI']]
-
-            # Store the DataFrame for the current video
-            self.mating_start_times_dfs[video_path] = mating_times_df
-
-            # Update the GUI with the new mating times
-            mating_time_text = "\n".join(
-                [f"ROI {row['ROI']}: {row['Start Time']:.2f} seconds" for _, row in mating_times_df.iterrows()])
-            self.verified_mating_times_label.setText(mating_time_text)
-        else:
-            print("Error: video_thread for the current video is None or doesn't have the required attributes")
-
-    def set_fps_from_video(self, video_path):
-        cap = cv2.VideoCapture(video_path)
-        fps = cap.get(cv2.CAP_PROP_FPS)
-        cap.release()
-        self.fps_input.setText(str(fps))
-
+    # ----------------------------------------------------------------
+    # Video selection and processing start
+    # ----------------------------------------------------------------
     def select_video(self):
-        # Use getOpenFileNames to select multiple videos
         video_paths, _ = QFileDialog.getOpenFileNames(self, "Select Videos")
         if video_paths:
             self.video_paths.extend(video_paths)
             for video_path in video_paths:
-                self.set_fps_from_video(video_path)
+                # Fix 24: store FPS per video and update the shared field to the last selected
+                fps = self._store_fps_from_video(video_path)
+                if fps:
+                    self.fps_input.setText(str(fps))
                 self.video_threads[video_path] = None
-                # Add video filename to the list widget
                 self.video_list_widget.addItem(video_path.split("/")[-1])
-            # Enable start button only if at least one video is selected
             self.start_button.setEnabled(len(self.video_paths) > 0)
-    def start_processing(self):
-        if self.video_paths and self.fps_input.text():
-            self.start_button.setEnabled(False)
-            self.select_button.setEnabled(False)
-            self.stop_button.setEnabled(True)
-            fps = float(self.fps_input.text())
-            # Retrieve the skip frames value
-            skip_seconds = float(self.skip_frames_input.text()) if self.skip_frames_input.text() else 0
-            skip_frames = int(skip_seconds * fps)  # Convert seconds to frames
-            try:
-                perf_frame_skips = int(self.frame_skip_input.text())
-            except ValueError:
-                perf_frame_skips = 1 # Default value if input is invalid
-            for video_path in self.video_paths:
-                if video_path not in self.video_threads or not self.video_threads[video_path]:
-                    video_thread = VideoProcessingThread(video_path, [], fps, skip_frames, perf_frame_skips)
-                    self.video_threads[video_path] = video_thread
-                    # Connect signals
-                    video_thread.mating_analysis_complete.connect(self.export_dataframe)
-                    video_thread.center_mating_duration_signal.connect(self.update_center_mating_duration)
-                    video_thread.verified_mating_start_times.connect(self.update_verified_mating_times)
-                    video_thread.center_gender_duration_signal.connect(self.update_center_gender_duration)
-                    video_thread.frame_info.connect(self.update_frame_info)
-                    video_thread.frame_processed.connect(self.update_video_frame)
-                    video_thread.frame_processed.connect(self.update_video_frame)
-                    video_thread.finished.connect(self.processing_finished)
-                    video_thread.void_roi_signal.connect(self.void_roi_handler)
-                    video_thread.start()
 
-            # Enable navigation buttons if there are multiple videos
-            self.prev_button.setEnabled(len(self.video_paths) > 1)
-            self.next_button.setEnabled(len(self.video_paths) > 1)
+    def start_processing(self):
+        if not self.video_paths:
+            self.show_error("No videos selected.")
+            return
+        # Fix 32: validate FPS
+        fps = self._parse_fps()
+        if fps is None:
+            return
+
+        self.start_button.setEnabled(False)
+        self.select_button.setEnabled(False)
+        self.stop_button.setEnabled(True)
+
+        skip_seconds = float(self.skip_frames_input.text()) if self.skip_frames_input.text() else 0
+        skip_frames = int(skip_seconds * fps)
+        try:
+            perf_frame_skips = int(self.frame_skip_input.text())
+            if perf_frame_skips < 1:
+                perf_frame_skips = 1
+        except ValueError:
+            perf_frame_skips = 1
+
+        for video_path in self.video_paths:
+            if video_path not in self.video_threads or not self.video_threads[video_path]:
+                # Fix 24: use per-video FPS if available
+                video_fps = self.video_fps.get(video_path, fps)
+                video_thread = VideoProcessingThread(
+                    video_path, [], video_fps, skip_frames, perf_frame_skips
+                )
+                self.video_threads[video_path] = video_thread
+                video_thread.frame_info.connect(self.update_frame_info)
+                video_thread.frame_processed.connect(self.update_video_frame)
+                video_thread.finished.connect(self.processing_finished)
+                video_thread.finished.connect(lambda: self._on_thread_finished(video_thread))
+                # Fix 17: wrap to discard the str argument from the signal
+                video_thread.mating_analysis_complete.connect(lambda _: self.export_dataframe())
+                video_thread.center_mating_duration_signal.connect(
+                    self.update_center_mating_duration
+                )
+                video_thread.verified_mating_start_times.connect(
+                    self.update_verified_mating_times
+                )
+                video_thread.center_gender_duration_signal.connect(
+                    self.update_center_gender_duration
+                )
+                video_thread.void_roi_signal.connect(self.void_roi_handler)
+                video_thread.start()
+
+        self.prev_button.setEnabled(len(self.video_paths) > 1)
+        self.next_button.setEnabled(len(self.video_paths) > 1)
 
     def stop_processing(self):
-        # Stop all video threads
         for video_thread in self.video_threads.values():
             if video_thread and video_thread.is_running:
                 video_thread.stop()
-        # Update the status label to indicate that processing has stopped
-        self.processing_status_label.setText('Video processing stopped.')
-        # Re-enable the start and select buttons
+        self.processing_status_label.setText("Video processing stopped.")
         self.start_button.setEnabled(True)
         self.select_button.setEnabled(True)
         self.stop_button.setEnabled(False)
 
     def processing_finished(self):
-        self.processing_status_label.setText('Video processing finished.')
+        self.processing_status_label.setText("Video processing finished.")
         self.start_button.setEnabled(True)
         self.select_button.setEnabled(True)
         self.stop_button.setEnabled(False)
 
+    # ----------------------------------------------------------------
+    # Frame update
+    # ----------------------------------------------------------------
     def update_video_frame(self, video_path, frame, mating_durations):
-        # Ensure that the current video index is within the valid range
         if 0 <= self.current_video_index < len(self.video_paths):
             current_video_path = self.video_paths[self.current_video_index]
             if video_path == current_video_path:
-                # Update video_label
                 height, width, channel = frame.shape
                 bytes_per_line = 3 * width
-                q_img = QImage(frame.data, width, height, bytes_per_line, QImage.Format.Format_RGB888).rgbSwapped()
+                q_img = QImage(
+                    frame.data, width, height, bytes_per_line, QImage.Format.Format_RGB888
+                ).rgbSwapped()
                 pixmap = QPixmap.fromImage(q_img)
-                pixmap = pixmap.scaled(self.video_label.width(), self.video_label.height(),
-                                       Qt.AspectRatioMode.KeepAspectRatio)
+                pixmap = pixmap.scaled(
+                    self.video_label.width(),
+                    self.video_label.height(),
+                    Qt.AspectRatioMode.KeepAspectRatio,
+                )
                 self.video_label.setPixmap(pixmap)
 
-                # Update mating_duration_label with the newest duration for each ROI
+                # Fix 11: mating_durations values are now floats
                 mating_duration_text = ""
-                for roi_id, durations in mating_durations.items():
-                    latest_duration = durations[-1] if durations else 0
-                    mating_duration_text += f"ROI {roi_id}: {latest_duration:.2f} seconds\n"
+                for roi_id, duration in mating_durations.items():
+                    mating_duration_text += f"ROI {roi_id}: {duration:.2f} s\n"
                 self.mating_duration_label.setText(mating_duration_text)
 
-                # Display mating start times for the current video
                 if video_path in self.mating_start_times_dfs:
-                    mating_times_df = self.mating_start_times_dfs[video_path]
-                    mating_time_text = "\n".join(
-                        [f"ROI {row['ROI']}: {row['Start Time']:.2f} seconds" for _, row in mating_times_df.iterrows()])
-                    self.verified_mating_times_label.setText(mating_time_text)
+                    df = self.mating_start_times_dfs[video_path]
+                    text = "\n".join(
+                        f"ROI {row['ROI']}: {row['Start Time']:.2f} s"
+                        for _, row in df.iterrows()
+                    )
+                    self.verified_mating_times_label.setText(text)
                 else:
                     self.verified_mating_times_label.setText("")
 
-        # Store the frame and mating durations for this video
         self.latest_frames[video_path] = frame
         self.latest_mating_durations[video_path] = mating_durations
 
     def update_frame_info(self, frame, time):
-        self.frame_label.setText(f'Frame: {frame}')
-        self.time_label.setText(f'Time (s): {time:.2f}')
+        self.frame_label.setText(f"Frame: {frame}")
+        self.time_label.setText(f"Time (s): {time:.2f}")
 
     def void_roi_handler(self, video_path, roi_id):
-        # Handle the void ROI, perhaps by updating the UI or logging
         print(f"ROI {roi_id} in video {video_path} has been marked as void.")
 
 
