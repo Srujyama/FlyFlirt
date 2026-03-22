@@ -165,7 +165,7 @@ Please read [CONTRIBUTING.md](CONTRIBUTING.md)
 ## License
 
 This project is licensed under the [MIT License](LICENSE).
-© 2025 Your Name — freely available for academic and commercial use with attribution.
+© 2026 Srujan Yamali — freely available for academic and commercial use with attribution.
 
 ---
 
